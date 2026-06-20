@@ -86,7 +86,11 @@ def _make_row(shot, start, duration, event, gsub):
 
 
 def attach_flux_pca(df: pd.DataFrame, fs_dir: str, n_pca=3) -> list:
-    """Add flux-surface PCA components as covariates (fit on the seed vectors)."""
+    """Add flux-surface PCA components as covariates (PCA fit on ALL seeds).
+
+    NOTE: this global PCA is fine for the *in-sample* fit but leaks across folds.
+    Use ``loso_cindex_fluxpca`` for an honest leave-one-shot-out C-index.
+    """
     files = df["fs_file"].dropna().unique()
     mats = {f: np.load(os.path.join(fs_dir, f))["r_theta"].ravel() for f in files}
     X = np.vstack([mats[f] for f in files])
@@ -99,6 +103,72 @@ def attach_flux_pca(df: pd.DataFrame, fs_dir: str, n_pca=3) -> list:
         df[c] = [pc[f][j] if pd.notna(f) and f in pc else np.nan
                  for f in df["fs_file"]]
     return cols
+
+
+def _flux_raw(df: pd.DataFrame, fs_dir: str):
+    """Per-interval raw flattened r(theta) matrix (NaN columns imputed/dropped)."""
+    cache = {}
+    rows = []
+    for f in df["fs_file"]:
+        if f not in cache:
+            cache[f] = np.load(os.path.join(fs_dir, f))["r_theta"].ravel()
+        rows.append(cache[f])
+    X = np.vstack(rows)
+    mu = np.nanmean(X, axis=0)
+    return np.where(np.isnan(X), mu, X)[:, ~np.isnan(mu)]
+
+
+def _persurf_raw(df: pd.DataFrame, fs_dir: str):
+    """Per-interval per-surface profile matrix (model 4: kappa/delta/R0/a x N)."""
+    keys = ["ps_kappa", "ps_delta_upper", "ps_delta_lower", "ps_R0", "ps_a"]
+    cache, rows = {}, []
+    for f in df["fs_file"]:
+        if f not in cache:
+            d = np.load(os.path.join(fs_dir, f))
+            cache[f] = np.concatenate([d[k] for k in keys])
+        rows.append(cache[f])
+    X = np.vstack(rows)
+    mu = np.nanmean(X, axis=0)
+    return np.where(np.isnan(X), mu, X)[:, ~np.isnan(mu)]
+
+
+def loso_risk(df: pd.DataFrame, Xraw: np.ndarray, n_pca=None, penalizer=0.1):
+    """Leave-one-shot-out Cox partial-hazard risk for a feature matrix ``Xraw``.
+
+    Scaler (+ optional per-fold PCA) and Cox are refit on TRAIN shots only — no
+    leakage. ``Xraw`` must be row-aligned with ``df`` (duration>0). Returns the
+    risk array (NaN where a fold could not be fit).
+    """
+    shots = df["shot"].to_numpy()
+    risk = np.full(len(df), np.nan)
+    for held in np.unique(shots):
+        tr, te = shots != held, shots == held
+        if df.loc[df.index[tr], "event"].sum() < 2:
+            continue
+        sc = StandardScaler().fit(Xraw[tr])
+        Ztr, Zte = sc.transform(Xraw[tr]), sc.transform(Xraw[te])
+        if n_pca and n_pca < Ztr.shape[1]:
+            pca = PCA(n_components=min(n_pca, tr.sum() - 1)).fit(Ztr)
+            Ztr, Zte = pca.transform(Ztr), pca.transform(Zte)
+        cols = [f"c{i}" for i in range(Ztr.shape[1])]
+        dtr = pd.DataFrame(Ztr, columns=cols)
+        dtr["duration"] = df["duration"].to_numpy()[tr]
+        dtr["event"] = df["event"].to_numpy()[tr]
+        m = CoxPHFitter(penalizer=penalizer).fit(dtr, "duration", "event")
+        risk[te] = m.predict_partial_hazard(pd.DataFrame(Zte, columns=cols)).to_numpy()
+    return risk
+
+
+def cindex_from_risk(df: pd.DataFrame, risk: np.ndarray):
+    ok = ~np.isnan(risk)
+    return concordance_index(df["duration"].to_numpy()[ok], -risk[ok],
+                             df["event"].to_numpy()[ok])
+
+
+def loso_cindex_fluxpca(df: pd.DataFrame, fs_dir: str, n_pca=3, penalizer=0.1):
+    """Honest leave-one-shot-out C-index for the flux-surface representation."""
+    d = df[df["duration"] > 0].reset_index(drop=True)
+    return cindex_from_risk(d, loso_risk(d, _flux_raw(d, fs_dir), n_pca, penalizer))
 
 
 # --------------------------------------------------------------------------- #
@@ -144,16 +214,20 @@ def main(argv=None):
           f"censored={int((df.event == 0).sum())}")
     print(f"median inter-ELM duration={df[df.event==1].duration.median()*1e3:.1f} ms\n")
 
-    flux_cols = attach_flux_pca(df, os.path.join(args.labels_dir, "fluxsurfaces"),
-                                args.n_pca)
-    sets = {"scalar(LCFS)": SCALAR_COVARIATES, "flux-PCA": flux_cols}
+    fs_dir = os.path.join(args.labels_dir, "fluxsurfaces")
+    flux_cols = attach_flux_pca(df, fs_dir, args.n_pca)
 
     print(f"{'covariates':18s}{'n_int':>7}{'C(in-sample)':>14}{'C(LOSO)':>10}")
     fits = {}
-    for name, cov in sets.items():
-        cph, in_c, loso_c, n = fit_and_score(df, cov, args.penalizer)
-        fits[name] = cph
-        print(f"{name:18s}{n:>7}{in_c:>14.3f}{loso_c:>10.3f}")
+    # scalar: raw covariates, no PCA -> LOSO already leak-free
+    cph, in_c, loso_c, n = fit_and_score(df, SCALAR_COVARIATES, args.penalizer)
+    fits["scalar(LCFS)"] = cph
+    print(f"{'scalar(LCFS)':18s}{n:>7}{in_c:>14.3f}{loso_c:>10.3f}")
+    # flux: in-sample via global PCA; LOSO via per-fold PCA (honest, no leakage)
+    cph_f, in_cf, _, nf = fit_and_score(df, flux_cols, args.penalizer)
+    fits["flux-PCA"] = cph_f
+    loso_cf = loso_cindex_fluxpca(df, fs_dir, args.n_pca, args.penalizer)
+    print(f"{'flux-PCA':18s}{nf:>7}{in_cf:>14.3f}{loso_cf:>10.3f}  (per-fold PCA)")
 
     print("\nScalar hazard ratios (per +1 SD; HR>1 = shorter interval / higher ELM risk):")
     hr = fits["scalar(LCFS)"].summary[["coef", "exp(coef)", "p"]]

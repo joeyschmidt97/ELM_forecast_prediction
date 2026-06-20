@@ -228,7 +228,10 @@ def flux_surface_profile(ds, n_surfaces=10, n_theta=64, level_lo=0.1, level_hi=0
                 and _point_in_poly(rmag, zmag, s)]
         if not segs:
             per_surface.append({}); continue
-        seg = max(segs, key=len)
+        # the true flux surface is the TIGHTEST closed loop around the axis; a
+        # larger spurious contour can also enclose the axis because psi_N is
+        # non-monotonic in the SOL/private-flux region, so pick min radial extent.
+        seg = min(segs, key=lambda s: np.max(np.hypot(s[:, 0] - rmag, s[:, 1] - zmag)))
         _, r_theta[i] = _resample_theta(seg, rmag, zmag, n_theta)
         per_surface.append(shape_from_boundary(seg[:, 0], seg[:, 1]))
     return dict(levels=levels, theta=theta, r_theta=r_theta,
